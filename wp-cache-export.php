@@ -22,8 +22,24 @@ class WP_Super_Cache_Export {
 
   const EXPORT_NONCE = 'wp-super-cache-export';
 
+  const OPTIONS = array(
+    'ossdl_cname',
+    'ossdl_https',
+    'ossdl_off_cdn_url',
+    'ossdl_off_include_dirs',
+    'ossdl_off_exclude',
+    'preload_cache_counter',
+    'wpsupercache_start',
+    'wpsupercache_count',
+    'supercache_last_cached',
+    'supercache_stats',
+    'wpsupercache_gc_time',
+  );
+
   static $cache_config_file;
+
   static $cache_config_file_sample;
+
   static $MESSAGES = array();
 
   /**
@@ -43,13 +59,16 @@ class WP_Super_Cache_Export {
 
   function __construct() {
     global $wp_cache_config_file, $wp_cache_config_file_sample;
+
     self::$cache_config_file = $wp_cache_config_file;
     self::$cache_config_file_sample = $wp_cache_config_file;
     self::$MESSAGES = array(
       0 =>  array( 'success', __( 'Settings imported', 'wp-super-cache' ) ),
       1 =>  array( 'warning', __( 'Please upload an exported WP Super Cache settings file.', 'wp-super-cache' ) ),
       2 =>  array( 'error', __( 'Unable to import the uploaded JSON file. Please export the settings and import them again.', 'wp-super-cache' ) ),
+      3 =>  array( 'error', __( 'Unable to create backup settings file. Please check that the wp-content folder is writable via the <em>chmod</em> command on your server.', 'wp-super-cache' ) ),
     );
+
     add_action( 'load-settings_page_wpsupercache', array( $this, 'export' ) );
     add_action( 'load-settings_page_wpsupercache', array( $this, 'import' ) );
   }
@@ -153,8 +172,21 @@ class WP_Super_Cache_Export {
     }
     // Backup the current config file to the same directory with a .backup file extension.
     if ( file_exists( self::$cache_config_file) ) {
-      rename( self::$cache_config_file, self::$cache_config_file . '.backup' );
+      $renamed = @rename( self::$cache_config_file, str_replace( '.php', '-backup.php', self::$cache_config_file ) );
+      if ( ! $renamed ) {
+        wp_safe_redirect( add_query_arg( 'message', 3, $location ) );
+        exit;
+      }
     }
+
+    // Update the database options that are not stored in the wp-cache-config.php file
+    if ( isset( $settings[ '_wp_super_cache_options' ] ) ) {
+      foreach ( $settings[ '_wp_super_cache_options'] as $key => $value ) {
+        update_option( $key, $value );
+      }
+      unset( $settings[ '_wp_super_cache_options' ] );
+    }
+
     // Create a new config file from the original sample
     wp_cache_verify_config_file();
     foreach ( $settings as $setting => $value) {
@@ -162,7 +194,7 @@ class WP_Super_Cache_Export {
         // todo: this specific setting outlier could be avoided if the initial config file was adjusted slightly
         if ( $setting === 'wp_cache_pages' ) {
           foreach ($value as $key => $key_value ) {
-            $key_value = is_numeric($key_value) ? $key_value : "\"$key_value\"";
+            $key_value = $this->sanitize_value( $key_value );
             wp_cache_replace_line( '^ *\$' . $setting . '\[ "' . $key . '" \]' ,"\$" . $setting . "[ \"" . $key . "\" ] = $key_value;", self::$cache_config_file );
           }
         } else {
@@ -170,7 +202,7 @@ class WP_Super_Cache_Export {
             wp_cache_replace_line( '^ *\$' . $setting. ' =', "\$$setting = $text;", self::$cache_config_file );
         }
       } else {
-        $value = is_numeric($value) ? $value : "\"$value\"";
+        $value = $this->sanitize_value( $value );
         wp_cache_replace_line( '^ *\$' . $setting. ' =', "\$$setting = $value;", self::$cache_config_file );
       }
     }
@@ -182,8 +214,9 @@ class WP_Super_Cache_Export {
    * Exports the current settings into a JSON file that can be imported into another WP Super Cache.
    *
    * When a user clicks the export button WordPress checks if the request is valid.
-   * No variables are declared in the scope of this function. When the configuration file is included
-   * its variables are the only ones that are declared. These variables are then encoded and downloaded
+   * Within the scope of this function, when the configuration file is included
+   * its variables are the only ones that are declared and gathered.  The additional options are
+   * then retrieved from the database. These variables are then encoded and downloaded
    * as a JSON file.
    *
    * @since  1.4.4
@@ -200,11 +233,55 @@ class WP_Super_Cache_Export {
     check_admin_referer(  self::EXPORT_NONCE );
     include self::$cache_config_file;
     $wp_cache_config_vars = get_defined_vars();
+    $wp_cache_config_options = $this->gather_plugin_options();
     nocache_headers();
     header( "Content-disposition: attachment; filename=" . self::TITLE );
-    header( 'Content-Type: application/octet-stream; charset=' . get_option( 'blog_charset' ) );
-    echo json_encode( $wp_cache_config_vars );
+    header( 'Content-Type: application/octet-stream;' );
+    echo json_encode( array_merge($wp_cache_config_vars, $wp_cache_config_options )  );
     die();
+  }
+
+  /**
+   * This is a private function that gathers all the database options WP Super Cache stores outside of the wp-cache-config.php file.
+   * The array of option names is stored as a class constant.
+   *
+   * @since  1.4.4
+   *
+   * @uses  get_option Gather the array of option key/value pairs.
+   *
+   * @return array An array of the key/value pairs for the WP Super Cache options stored in the database
+   */
+  private function gather_plugin_options() {
+    $options = array();
+    foreach ( self::OPTIONS  as $value ) {
+      $options[ $value ] = get_option( $value );
+    }
+    return array( '_wp_super_cache_options' => $options );
+  }
+
+  /**
+   * This is a private function dedicated to sanitizing the JSON file input.
+   * Given that a malicious JSON file could be uploaded and converted into the plugin settings it is best practice to sanitize
+   * the JSON values before converting them.
+   *
+   * Since only numeric values and strings are accepted inputs we cast integers on numeric values and strip tags/escape
+   * the html of string values.
+   *
+   * @since  1.4.4
+   *
+   * @uses esc_html Escape the string values
+   *
+   * @return number|string A sanitized version of the input value.
+   */
+
+  private function sanitize_value( $value ) {
+    if ( is_numeric( $value ) ) {
+      return (int)  $value;
+    }
+    if ( is_string( $value ) ) {
+      $value = esc_html( strip_tags( $value ) );
+      return "\"$value\"";
+    }
   }
 
   /**
@@ -252,7 +329,7 @@ class WP_Super_Cache_Export {
    * @return boolean Whether or not the backup file exists
    */
   private function backupFileExists() {
-    return file_exists( self::$cache_config_file . '.backup' );
+    return file_exists( str_replace( '.php', '-backup.php', self::$cache_config_file ) );
   }
 
 }
